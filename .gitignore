@@ -1,0 +1,9 @@
+# Compiled binaries (root only)
+/sqlz
+/sqlz.exe
+/powerupsql
+/powerupsql.exe
+
+# OS
+.DS_Store
+Thumbs.db
