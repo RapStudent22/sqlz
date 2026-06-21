@@ -6,7 +6,7 @@ import (
 	"strings"
 	"time"
 
-	"sqlz/internal/mssql"
+	"github.com/RapStudent22/sqlz/internal/mssql"
 )
 
 func IsEnabled(client *mssql.Client) (bool, error) {

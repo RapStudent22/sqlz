@@ -9,7 +9,7 @@ import (
 
 	"github.com/go-ldap/ldap/v3"
 
-	"sqlz/internal/models"
+	"github.com/RapStudent22/sqlz/internal/models"
 )
 
 // Dialer is the same interface as mssql.Dialer — anything with DialContext.

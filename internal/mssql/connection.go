@@ -4,7 +4,7 @@ import (
 	"context"
 	"time"
 
-	"sqlz/internal/models"
+	"github.com/RapStudent22/sqlz/internal/models"
 )
 
 func (c *Client) TestConnection(

@@ -3,8 +3,8 @@ package discover
 import (
 	"fmt"
 
-	"sqlz/internal/discovery"
-	"sqlz/internal/models"
+	"github.com/RapStudent22/sqlz/internal/discovery"
+	"github.com/RapStudent22/sqlz/internal/models"
 )
 
 type Options struct {

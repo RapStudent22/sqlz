@@ -3,8 +3,8 @@ package runner
 import (
 	"sync"
 
-	"sqlz/internal/models"
-	"sqlz/internal/mssql"
+	"github.com/RapStudent22/sqlz/internal/models"
+	"github.com/RapStudent22/sqlz/internal/mssql"
 )
 
 type Config struct {

@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"time"
 
-	"sqlz/internal/mssql"
+	"github.com/RapStudent22/sqlz/internal/mssql"
 )
 
 type ServerPrivs struct {

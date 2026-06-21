@@ -3,8 +3,8 @@ package serverinfo
 import (
 	"sync"
 
-	"sqlz/internal/mssql"
-	"sqlz/internal/models"
+	"github.com/RapStudent22/sqlz/internal/mssql"
+	"github.com/RapStudent22/sqlz/internal/models"
 )
 
 type Options struct {

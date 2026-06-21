@@ -4,7 +4,7 @@ import (
 	"context"
 	"time"
 
-	"sqlz/internal/mssql"
+	"github.com/RapStudent22/sqlz/internal/mssql"
 )
 
 func Run(client *mssql.Client, query string) ([]map[string]any, error) {
