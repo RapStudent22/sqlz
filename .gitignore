@@ -1,8 +1,9 @@
-# Compiled binaries (root only)
+# Compiled binaries
 /sqlz
 /sqlz.exe
 /powerupsql
 /powerupsql.exe
+/dist/
 
 # OS
 .DS_Store
