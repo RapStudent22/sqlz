@@ -4,7 +4,7 @@ import "os"
 
 var enabled bool
 
-func init() {
+func initEnabled() {
 	if os.Getenv("NO_COLOR") != "" {
 		return
 	}
@@ -13,7 +13,6 @@ func init() {
 		return
 	}
 	mode := fi.Mode()
-	// disable if stdout is a pipe or a regular file (redirect) — works on Linux and Windows
 	if mode&os.ModeNamedPipe != 0 || mode.IsRegular() {
 		return
 	}

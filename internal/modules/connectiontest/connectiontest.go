@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/RapStudent22/sqlz/internal/models"
+	"github.com/RapStudent22/sqlz/internal/modules/relaycheck"
 	"github.com/RapStudent22/sqlz/internal/mssql"
 )
 
@@ -26,6 +27,9 @@ type Result struct {
 	Login         string
 	Roles         []string // active server roles, e.g. ["sysadmin", "dbcreator"]
 	Error         error
+	// ForceEncrypt is nil when the TDS pre-login check failed, otherwise true/false.
+	ForceEncrypt *bool
+	Encrypt      relaycheck.EncryptMode
 }
 
 type ResultCallback func(Result)
@@ -43,6 +47,13 @@ func testOne(inst models.SQLInstance, opts Options) Result {
 	authType := opts.AuthType
 	if authType == 0 {
 		authType = mssql.AuthSQL
+	}
+
+	rc := relaycheck.Check(inst, relaycheck.Options{Dialer: opts.Dialer})
+	var forceEncrypt *bool
+	if rc.Error == "" {
+		fe := rc.ForceEncrypt
+		forceEncrypt = &fe
 	}
 
 	client, err := mssql.New(mssql.Config{
@@ -65,13 +76,15 @@ func testOne(inst models.SQLInstance, opts Options) Result {
 		if cr.Error != "" {
 			connErr = errors.New(cr.Error)
 		}
-		return Result{Instance: inst, Error: connErr}
+		return Result{Instance: inst, Error: connErr, ForceEncrypt: forceEncrypt, Encrypt: rc.Encrypt}
 	}
 
 	result := Result{
 		Instance:      inst,
 		Authenticated: true,
 		Version:       cr.Version,
+		ForceEncrypt:  forceEncrypt,
+		Encrypt:       rc.Encrypt,
 	}
 
 	// query login name + key server roles

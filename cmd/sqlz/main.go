@@ -22,6 +22,7 @@ import (
 	"github.com/RapStudent22/sqlz/internal/modules/links"
 	"github.com/RapStudent22/sqlz/internal/modules/logins"
 	"github.com/RapStudent22/sqlz/internal/modules/privs"
+	"github.com/RapStudent22/sqlz/internal/modules/relaycheck"
 	"github.com/RapStudent22/sqlz/internal/modules/shell"
 	"github.com/RapStudent22/sqlz/internal/modules/sqlquery"
 	"github.com/RapStudent22/sqlz/internal/modules/tables"
@@ -417,11 +418,13 @@ func runScan() {
 		color.Count(fmt.Sprintf("%d", workersVal)))
 
 	type scanRow struct {
-		Host    string `json:"host"`
-		Port    int    `json:"port"`
-		Auth    bool   `json:"authenticated"`
-		Version string `json:"version,omitempty"`
-		Error   string `json:"error,omitempty"`
+		Host         string `json:"host"`
+		Port         int    `json:"port"`
+		Auth         bool   `json:"authenticated"`
+		ForceEncrypt *bool  `json:"force_encrypt,omitempty"`
+		Encrypt      string `json:"encrypt,omitempty"`
+		Version      string `json:"version,omitempty"`
+		Error        string `json:"error,omitempty"`
 	}
 	var all []scanRow
 	ok := 0
@@ -438,19 +441,32 @@ func runScan() {
 		if r.Error != nil {
 			errStr = r.Error.Error()
 		}
-		all = append(all, scanRow{r.Instance.Hostname, r.Instance.Port, r.Authenticated, r.Version, errStr})
+		all = append(all, scanRow{
+			Host:         r.Instance.Hostname,
+			Port:         r.Instance.Port,
+			Auth:         r.Authenticated,
+			ForceEncrypt: r.ForceEncrypt,
+			Encrypt:      r.Encrypt.String(),
+			Version:      r.Version,
+			Error:        errStr,
+		})
 		if r.Authenticated {
 			ok++
 		}
 		if !jsonOutVal {
+			encStr := formatEncrypt(r.ForceEncrypt, r.Encrypt)
 			if r.Authenticated {
-				fmt.Printf("%s %s   %s   %s\n",
+				fmt.Printf("%s %s   %s   %s   %s\n",
 					color.OK("[OK]"),
 					hostStr(r.Instance.Hostname, r.Instance.Port),
 					color.Bold(r.Login),
-					formatRoles(r.Roles))
+					formatRoles(r.Roles),
+					encStr)
 			} else {
-				fmt.Printf("%s %s\n", color.Fail("[FAIL]"), hostStr(r.Instance.Hostname, r.Instance.Port))
+				fmt.Printf("%s %s   %s\n",
+					color.Fail("[FAIL]"),
+					hostStr(r.Instance.Hostname, r.Instance.Port),
+					encStr)
 			}
 		}
 	})
@@ -858,7 +874,7 @@ Usage: sqlz <command> [flags] [args]
 
 Commands:
   discover    Find SQL instances via LDAP SPN search
-  scan        Test auth + show privileges for each instance
+  scan        Test auth + show privileges; checks Force Encryption via TDS pre-login
   info        Server version, edition, sysadmin, service account
   databases   List databases  (alias: dbs)
   tables      List tables     (use --db to select database)
@@ -921,6 +937,17 @@ Examples:
 
 
 // ---- utils ----
+
+// formatEncrypt renders the Force Encryption result for scan output.
+func formatEncrypt(fe *bool, enc relaycheck.EncryptMode) string {
+	if fe == nil {
+		return color.Dim("[enc:?]")
+	}
+	if *fe {
+		return color.Good(fmt.Sprintf("[enc:%s]", enc))
+	}
+	return color.Danger(fmt.Sprintf("[enc:%s RELAYABLE]", enc))
+}
 
 // formatRoles renders a role list: sysadmin in bold red, others in yellow.
 func formatRoles(roles []string) string {
