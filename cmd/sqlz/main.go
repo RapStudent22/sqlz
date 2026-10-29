@@ -151,6 +151,12 @@ func main() {
 	if sprayVal != "" && cmd != "scan" {
 		die(fmt.Errorf("--spray is only supported by the scan command"))
 	}
+	// Spray needs explicit targets: the LDAP-discovery fallback binds with
+	// the global credentials, which would burn bad-password attempts in AD
+	// for nothing when the spray itself is what's being tested.
+	if sprayVal != "" && targetsVal == "" && hostVal == "" {
+		die(fmt.Errorf("--spray requires explicit targets: use -H/--host or -t/--targets"))
+	}
 	// Resolve the KDC up front so a missing KDC fails loudly before any
 	// connection attempt, and every worker uses the same address.
 	if getAuth() == mssql.AuthKerberos {
@@ -617,6 +623,12 @@ func runScan() {
 	sprayCreds, err := loadSpray()
 	if err != nil {
 		die(err)
+	}
+	if len(sprayCreds) > 0 {
+		fmt.Printf("%s Spray mode: %s pair(s) × %s host(s) — every failed login is a bad-password attempt in AD. Watch the account lockout policy!\n\n",
+			color.Warn("[!]"),
+			color.Count(fmt.Sprintf("%d", len(sprayCreds))),
+			color.Count(fmt.Sprintf("%d", len(instances))))
 	}
 
 	kdc := ""
