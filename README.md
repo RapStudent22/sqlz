@@ -120,6 +120,23 @@ sqlz scan -H sql01.corp.local -d corp.local --auth kerberos -dc 10.0.0.1 --ccach
 На Windows `--auth kerberos` без кредов сам падает в SSPI — можно вообще
 не думать, какой режим выбрать, если сидишь в доменной сессии.
 
+**Discovery тоже умеет Kerberos.** Если цели не заданы через `-H`/`-t`,
+скан сначала соберёт инстансы из LDAP — и с `--auth kerberos` этот бинд
+пойдёт через GSS-SPNEGO (как у impacket), а не через пароль:
+
+```bash
+# discovery + scan одной командой, цели из LDAP по SPN
+sqlz scan -d corp.local -u user --hash <32-hex> --auth kerberos -dc DC1.corp.local -ns 10.0.0.1
+
+# или просто собрать список
+sqlz discover -dc DC1.corp.local -d corp.local -u user --aes-key <64-hex> --auth kerberos -ns 10.0.0.1
+```
+
+Нюанс: для Kerberos-discovery DC нужно передавать **по имени**
+(`-dc DC1.corp.local`) — из него строится SPN `ldap/<host>`. Если дать IP,
+попробуем обратный PTR-запрос через `--nameserver`; не получится — будет
+понятная ошибка с подсказкой.
+
 Ошибки тулза объясняет по-человечески: неверный пароль/хэш/ключ — так и
 напишет, рассинхрон часов с доменом — посоветует NTP, отсутствие SPN на
 цели — скажет прямо. В JSON-выводе scan для этого есть поля

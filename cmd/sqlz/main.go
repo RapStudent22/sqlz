@@ -157,6 +157,16 @@ func main() {
 	if sprayVal != "" && targetsVal == "" && hostVal == "" {
 		die(fmt.Errorf("--spray requires explicit targets: use -H/--host or -t/--targets"))
 	}
+	// LDAP discovery has no SSPI path: Kerberos there needs real key
+	// material (password / AES key / NT hash / ccache).
+	if cmd == "discover" {
+		if getAuth() == mssql.AuthSSPI {
+			die(fmt.Errorf("--auth sspi is not supported for LDAP discovery; use --auth kerberos with --password/--aes-key/--hash or --auth windows with --password"))
+		}
+		if getAuth() == mssql.AuthKerberos && passwordVal == "" && aesKeyVal == "" && hashVal == "" && ccacheVal == "" {
+			die(fmt.Errorf("discover with --auth kerberos requires --password, --aes-key, --hash or --ccache"))
+		}
+	}
 	// Resolve the KDC up front so a missing KDC fails loudly before any
 	// connection attempt, and every worker uses the same address.
 	if getAuth() == mssql.AuthKerberos {
@@ -344,13 +354,31 @@ func getInstances() ([]models.SQLInstance, error) {
 		if dc == "" {
 			return nil, fmt.Errorf("specify -H/--host, -t/--targets, or -dc/--dc-ip")
 		}
+		// Default NS: DC IP (when -dc is set). Override with -ns.
+		ns := nsVal
+		if ns == "" {
+			ns = getDC()
+		}
+		kdc := ""
+		if getAuth() == mssql.AuthKerberos {
+			kdc = getKDC()
+		}
 		instances, err = discovery.DiscoverSQLInstances(discovery.LDAPConfig{
-			Server:   dc,
-			BaseDN:   baseDNVal,
-			Domain:   domainVal,
-			Username: usernameVal,
-			Password: passwordVal,
-			Dialer:   getDialer(),
+			Server:     dc,
+			BaseDN:     baseDNVal,
+			Domain:     domainVal,
+			Username:   usernameVal,
+			Password:   passwordVal,
+			Dialer:     getDialer(),
+			Nameserver: ns,
+			AuthType:   getAuth(),
+			Realm:      kerberosRealm(),
+			KDC:        kdc,
+			AESKey:     aesKeyVal,
+			Hash:       hashVal,
+			CCache:     ccacheVal,
+			KrbEType:   krbEtypeVal,
+			KVNO:       kvnoVal,
 		})
 	}
 	if err != nil {

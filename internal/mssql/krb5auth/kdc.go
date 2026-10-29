@@ -6,6 +6,7 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // ResolveKDC determines the KDC address (host:port) for a domain.
@@ -17,10 +18,10 @@ import (
 // to that server instead of the system resolver.
 func ResolveKDC(ctx context.Context, kdcFlag, dcIP, domain, nameserver string) (string, error) {
 	if kdcFlag != "" {
-		return withDefaultPort(kdcFlag, 88), nil
+		return withDefaultPort(resolveOrSelf(ctx, kdcFlag, nameserver), 88), nil
 	}
 	if dcIP != "" {
-		return withDefaultPort(dcIP, 88), nil
+		return withDefaultPort(resolveOrSelf(ctx, dcIP, nameserver), 88), nil
 	}
 	if domain == "" {
 		return "", fmt.Errorf(
@@ -72,6 +73,28 @@ func resolveHost(ctx context.Context, r *net.Resolver, host string) string {
 		}
 	}
 	return ""
+}
+
+// resolveOrSelf resolves a KDC/DC hostname to an IP via the nameserver so
+// the krb5 config never depends on the system resolver. IP literals and
+// unresolvable names pass through unchanged (the dial error will name the
+// host clearly).
+func resolveOrSelf(ctx context.Context, host, nameserver string) string {
+	if net.ParseIP(host) != nil || nameserver == "" {
+		return host
+	}
+	r := &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, network, net.JoinHostPort(nameserver, "53"))
+		},
+	}
+	cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if ip := resolveHost(cctx, r, host); ip != "" {
+		return ip
+	}
+	return host
 }
 
 func withDefaultPort(host string, port int) string {

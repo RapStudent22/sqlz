@@ -10,6 +10,7 @@ import (
 	"github.com/go-ldap/ldap/v3"
 
 	"github.com/RapStudent22/sqlz/internal/models"
+	"github.com/RapStudent22/sqlz/internal/mssql"
 )
 
 // Dialer is the same interface as mssql.Dialer — anything with DialContext.
@@ -18,13 +19,28 @@ type Dialer interface {
 }
 
 type LDAPConfig struct {
-	Server   string
-	Port     int
+	Server string
+	Port   int
 
 	Domain   string
 	Username string
 	Password string
 	BaseDN   string
+
+	// Nameserver resolves the LDAP server hostname when -dc is not an IP.
+	Nameserver string
+
+	// Kerberos (GSSAPI SASL bind) options. AuthType == mssql.AuthKerberos
+	// switches the bind from simple password to Kerberos; KDC must already
+	// be resolved by the caller.
+	AuthType mssql.AuthType
+	Realm    string
+	KDC      string
+	AESKey   string
+	Hash     string
+	CCache   string
+	KrbEType string
+	KVNO     int
 
 	// Dialer, when non-nil, routes the LDAP connection through it (e.g. SOCKS5).
 	Dialer Dialer
@@ -82,12 +98,28 @@ func tryBind(conn *ldap.Conn, username, password, domain string) error {
 
 func DiscoverSQLInstances(cfg LDAPConfig) ([]models.SQLInstance, error) {
 
+	// Kerberos uses its own minimal LDAP client: go-ldap's SASL bind
+	// hardcodes the GSSAPI mechanism, which AD rejects — it expects
+	// GSS-SPNEGO (impacket-style).
+	if cfg.AuthType == mssql.AuthKerberos {
+		return kerberosDiscover(cfg)
+	}
+
 	port := cfg.Port
 	if port == 0 {
 		port = 389
 	}
 
-	address := fmt.Sprintf("%s:%d", cfg.Server, port)
+	// Resolve the LDAP server hostname (when -dc is not an IP) through the
+	// configured nameserver so the dial does not depend on system DNS.
+	host := cfg.Server
+	if net.ParseIP(host) == nil {
+		if ip := resolveHostIP(context.Background(), cfg.Nameserver, host); ip != "" {
+			host = ip
+		}
+	}
+
+	address := fmt.Sprintf("%s:%d", host, port)
 
 	var conn *ldap.Conn
 	var err error
@@ -214,4 +246,67 @@ func domainToBaseDN(domain string) string {
 		}
 	}
 	return strings.Join(dcs, ",")
+}
+
+// ldapSPNFor builds the ldap/<hostname> SPN for the Kerberos bind. The DC
+// must be addressed by name for Kerberos: if an IP was passed, a reverse
+// lookup through the nameserver is attempted.
+func ldapSPNFor(server, nameserver string) (string, error) {
+	host := server
+	if net.ParseIP(host) != nil {
+		name, err := reverseLookup(context.Background(), nameserver, host)
+		if err != nil || name == "" {
+			return "", fmt.Errorf(
+				"kerberos discovery needs the DC hostname to build the ldap/ SPN — pass -dc DC1.cs.org instead of an IP (or fix the PTR record)")
+		}
+		host = name
+	}
+	return "ldap/" + strings.TrimSuffix(host, "."), nil
+}
+
+// resolveHostIP resolves a hostname through the configured nameserver and
+// returns the first IPv4 address, or "" when it can't be resolved.
+func resolveHostIP(ctx context.Context, nameserver, host string) string {
+	if nameserver == "" {
+		return ""
+	}
+	r := &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, network, net.JoinHostPort(nameserver, "53"))
+		},
+	}
+	cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	addrs, err := r.LookupHost(cctx, host)
+	if err != nil {
+		return ""
+	}
+	for _, addr := range addrs {
+		if ip := net.ParseIP(addr); ip != nil && ip.To4() != nil {
+			return addr
+		}
+	}
+	return ""
+}
+
+// reverseLookup resolves an IP back to a hostname through the configured
+// nameserver (PTR), returning "" on failure.
+func reverseLookup(ctx context.Context, nameserver, ip string) (string, error) {
+	if nameserver == "" {
+		return "", nil
+	}
+	r := &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, network, net.JoinHostPort(nameserver, "53"))
+		},
+	}
+	cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	names, err := r.LookupAddr(cctx, ip)
+	if err != nil || len(names) == 0 {
+		return "", err
+	}
+	return strings.TrimSuffix(names[0], "."), nil
 }
