@@ -402,10 +402,6 @@ func getInstances() ([]models.SQLInstance, error) {
 // If the hostname is already an IP, or ConnHost is already set, skip it.
 // With a SOCKS5 proxy the DNS queries go over TCP through it.
 func resolveInstances(instances []models.SQLInstance, ns string, d krb5auth.Dialer) {
-	r := krb5auth.NameserverResolver(ns, d)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
 	for i := range instances {
 		if instances[i].ConnHost != "" {
 			continue
@@ -414,16 +410,13 @@ func resolveInstances(instances []models.SQLInstance, ns string, d krb5auth.Dial
 		if net.ParseIP(instances[i].Hostname) != nil {
 			continue
 		}
-		addrs, err := r.LookupHost(ctx, instances[i].Hostname)
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		ip, err := krb5auth.LookupHostIP(ctx, ns, instances[i].Hostname, d)
+		cancel()
 		if err != nil {
 			continue
 		}
-		for _, addr := range addrs {
-			if ip := net.ParseIP(addr); ip != nil && ip.To4() != nil {
-				instances[i].ConnHost = addr
-				break
-			}
-		}
+		instances[i].ConnHost = ip
 	}
 }
 

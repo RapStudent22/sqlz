@@ -272,19 +272,13 @@ func resolveHostIP(ctx context.Context, nameserver, host string, d krb5auth.Dial
 	if nameserver == "" {
 		return ""
 	}
-	r := krb5auth.NameserverResolver(nameserver, d)
 	cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	addrs, err := r.LookupHost(cctx, host)
+	ip, err := krb5auth.LookupHostIP(cctx, nameserver, host, d)
 	if err != nil {
 		return ""
 	}
-	for _, addr := range addrs {
-		if ip := net.ParseIP(addr); ip != nil && ip.To4() != nil {
-			return addr
-		}
-	}
-	return ""
+	return ip
 }
 
 // reverseLookup resolves an IP back to a hostname through the configured
@@ -293,12 +287,7 @@ func reverseLookup(ctx context.Context, nameserver, ip string, d krb5auth.Dialer
 	if nameserver == "" {
 		return "", nil
 	}
-	r := krb5auth.NameserverResolver(nameserver, d)
 	cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	names, err := r.LookupAddr(cctx, ip)
-	if err != nil || len(names) == 0 {
-		return "", err
-	}
-	return strings.TrimSuffix(names[0], "."), nil
+	return krb5auth.LookupPTR(cctx, nameserver, ip, d)
 }

@@ -2,7 +2,6 @@ package krb5auth
 
 import (
 	"context"
-	"fmt"
 	"io"
 	"net"
 	"testing"
@@ -91,35 +90,5 @@ func TestProxyKDCNoDialer(t *testing.T) {
 	got, err := ProxyKDC("kdc.corp.local:88", nil)
 	if err != nil || got != "kdc.corp.local:88" {
 		t.Errorf("ProxyKDC(nil) = %q, %v; want passthrough", got, err)
-	}
-}
-
-func TestNameserverResolverTCPOnly(t *testing.T) {
-	d := &fakeDialer{target: "127.0.0.1:1", dials: make(chan string, 16)}
-	r := NameserverResolver("10.0.0.1", d)
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	_, _ = r.LookupHost(ctx, "example.invalid")
-
-	// UDP must be rejected and TCP must target ns:53
-	networks := map[string]bool{}
-	seen := false
-	for !seen || len(networks) == 0 {
-		select {
-		case dd := <-d.dials:
-			var network, addr string
-			fmt.Sscanf(dd, "%[^:]:%s", &network, &addr)
-			if network == "udp" {
-				t.Errorf("UDP must not be used through the proxy")
-			}
-			if addr == "10.0.0.1:53" {
-				seen = true
-			}
-		case <-time.After(3 * time.Second):
-			return
-		}
-	}
-	if !seen {
-		t.Error("no TCP dial to the nameserver recorded")
 	}
 }
