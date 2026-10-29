@@ -241,7 +241,7 @@ func getKDC() string {
 	if ns == "" {
 		ns = getDC()
 	}
-	kdc, err := krb5auth.ResolveKDC(context.Background(), kdcVal, getDC(), domainVal, ns)
+	kdc, err := krb5auth.ResolveKDC(context.Background(), kdcVal, getDC(), domainVal, ns, getDialer())
 	if err != nil {
 		die(err)
 	}
@@ -392,7 +392,7 @@ func getInstances() ([]models.SQLInstance, error) {
 		ns = getDC()
 	}
 	if ns != "" {
-		resolveInstances(instances, ns)
+		resolveInstances(instances, ns, getDialer())
 	}
 
 	return instances, nil
@@ -400,13 +400,9 @@ func getInstances() ([]models.SQLInstance, error) {
 
 // resolveInstances sets ConnHost on each instance by resolving via ns.
 // If the hostname is already an IP, or ConnHost is already set, skip it.
-func resolveInstances(instances []models.SQLInstance, ns string) {
-	r := &net.Resolver{
-		PreferGo: true,
-		Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
-			return (&net.Dialer{}).DialContext(ctx, "udp", net.JoinHostPort(ns, "53"))
-		},
-	}
+// With a SOCKS5 proxy the DNS queries go over TCP through it.
+func resolveInstances(instances []models.SQLInstance, ns string, d krb5auth.Dialer) {
+	r := krb5auth.NameserverResolver(ns, d)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 

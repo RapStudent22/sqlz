@@ -221,16 +221,25 @@ func (l *ldapConn) searchSPNs(baseDN, filter string) ([]string, error) {
 // kerberosDiscover runs the LDAP SPN discovery with a Kerberos SASL bind
 // (GSS-SPNEGO, impacket-style) over the minimal built-in client.
 func kerberosDiscover(cfg LDAPConfig) ([]models.SQLInstance, error) {
-	spn, err := ldapSPNFor(cfg.Server, cfg.Nameserver)
+	spn, err := ldapSPNFor(cfg.Server, cfg.Nameserver, cfg.Dialer)
 	if err != nil {
 		return nil, err
+	}
+
+	kdc := cfg.KDC
+	if cfg.Dialer != nil {
+		if local, err := krb5auth.ProxyKDC(kdc, cfg.Dialer); err != nil {
+			return nil, err
+		} else {
+			kdc = local
+		}
 	}
 
 	cl, err := krb5auth.Login(krb5auth.Params{
 		Username: cfg.Username,
 		Password: cfg.Password,
 		Realm:    cfg.Realm,
-		KDC:      cfg.KDC,
+		KDC:      kdc,
 		AESKey:   cfg.AESKey,
 		Hash:     cfg.Hash,
 		CCache:   cfg.CCache,
@@ -255,7 +264,7 @@ func kerberosDiscover(cfg LDAPConfig) ([]models.SQLInstance, error) {
 	// nameserver so the dial does not depend on system DNS.
 	host := cfg.Server
 	if net.ParseIP(host) == nil {
-		if ip := resolveHostIP(context.Background(), cfg.Nameserver, host); ip != "" {
+		if ip := resolveHostIP(context.Background(), cfg.Nameserver, host, cfg.Dialer); ip != "" {
 			host = ip
 		}
 	}

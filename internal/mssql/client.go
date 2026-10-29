@@ -11,6 +11,8 @@ import (
 	"time"
 
 	mssqldrv "github.com/microsoft/go-mssqldb"
+
+	"github.com/RapStudent22/sqlz/internal/mssql/krb5auth"
 )
 
 type AuthType int
@@ -95,6 +97,16 @@ func New(config Config) (*Client, error) {
 
 	if config.QueryTimeout == 0 {
 		config.QueryTimeout = 30 * time.Second
+	}
+
+	// Route KDC traffic through the SOCKS5 proxy too: gokrb5 dials the KDC
+	// itself, so a local relay is started and the krb5 config points at it.
+	if config.AuthType == AuthKerberos && config.Dialer != nil {
+		local, err := krb5auth.ProxyKDC(config.KDC, config.Dialer)
+		if err != nil {
+			return nil, err
+		}
+		config.KDC = local
 	}
 
 	connString, err := buildConnectionString(config)

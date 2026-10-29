@@ -78,6 +78,8 @@ func AuthHint(err error) string {
 
 	s := err.Error()
 	switch {
+	case strings.Contains(s, "error sending to a KDC"):
+		return "KDC unreachable — check --kdc/--dc-ip; with --proxy, port 88 must be reachable from the SOCKS5 proxy"
 	case strings.Contains(s, "KDC_ERR_PREAUTH_FAILED"):
 		return "pre-authentication failed — wrong password, NT hash or AES key"
 	case strings.Contains(s, "KDC_ERR_C_PRINCIPAL_UNKNOWN"):

@@ -11,6 +11,7 @@ import (
 
 	"github.com/RapStudent22/sqlz/internal/models"
 	"github.com/RapStudent22/sqlz/internal/mssql"
+	"github.com/RapStudent22/sqlz/internal/mssql/krb5auth"
 )
 
 // Dialer is the same interface as mssql.Dialer — anything with DialContext.
@@ -114,7 +115,7 @@ func DiscoverSQLInstances(cfg LDAPConfig) ([]models.SQLInstance, error) {
 	// configured nameserver so the dial does not depend on system DNS.
 	host := cfg.Server
 	if net.ParseIP(host) == nil {
-		if ip := resolveHostIP(context.Background(), cfg.Nameserver, host); ip != "" {
+		if ip := resolveHostIP(context.Background(), cfg.Nameserver, host, cfg.Dialer); ip != "" {
 			host = ip
 		}
 	}
@@ -251,10 +252,10 @@ func domainToBaseDN(domain string) string {
 // ldapSPNFor builds the ldap/<hostname> SPN for the Kerberos bind. The DC
 // must be addressed by name for Kerberos: if an IP was passed, a reverse
 // lookup through the nameserver is attempted.
-func ldapSPNFor(server, nameserver string) (string, error) {
+func ldapSPNFor(server, nameserver string, d krb5auth.Dialer) (string, error) {
 	host := server
 	if net.ParseIP(host) != nil {
-		name, err := reverseLookup(context.Background(), nameserver, host)
+		name, err := reverseLookup(context.Background(), nameserver, host, d)
 		if err != nil || name == "" {
 			return "", fmt.Errorf(
 				"kerberos discovery needs the DC hostname to build the ldap/ SPN — pass -dc DC1.cs.org instead of an IP (or fix the PTR record)")
@@ -265,17 +266,13 @@ func ldapSPNFor(server, nameserver string) (string, error) {
 }
 
 // resolveHostIP resolves a hostname through the configured nameserver and
-// returns the first IPv4 address, or "" when it can't be resolved.
-func resolveHostIP(ctx context.Context, nameserver, host string) string {
+// returns the first IPv4 address, or "" when it can't be resolved. With a
+// SOCKS5 dialer the DNS queries go over TCP through the proxy.
+func resolveHostIP(ctx context.Context, nameserver, host string, d krb5auth.Dialer) string {
 	if nameserver == "" {
 		return ""
 	}
-	r := &net.Resolver{
-		PreferGo: true,
-		Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
-			return (&net.Dialer{}).DialContext(ctx, network, net.JoinHostPort(nameserver, "53"))
-		},
-	}
+	r := krb5auth.NameserverResolver(nameserver, d)
 	cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	addrs, err := r.LookupHost(cctx, host)
@@ -292,16 +289,11 @@ func resolveHostIP(ctx context.Context, nameserver, host string) string {
 
 // reverseLookup resolves an IP back to a hostname through the configured
 // nameserver (PTR), returning "" on failure.
-func reverseLookup(ctx context.Context, nameserver, ip string) (string, error) {
+func reverseLookup(ctx context.Context, nameserver, ip string, d krb5auth.Dialer) (string, error) {
 	if nameserver == "" {
 		return "", nil
 	}
-	r := &net.Resolver{
-		PreferGo: true,
-		Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
-			return (&net.Dialer{}).DialContext(ctx, network, net.JoinHostPort(nameserver, "53"))
-		},
-	}
+	r := krb5auth.NameserverResolver(nameserver, d)
 	cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	names, err := r.LookupAddr(cctx, ip)

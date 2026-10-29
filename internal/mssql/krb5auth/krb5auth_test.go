@@ -143,25 +143,25 @@ func TestAuthHint(t *testing.T) {
 }
 
 func TestResolveKDCExplicit(t *testing.T) {
-	got, err := ResolveKDC(context.Background(), "10.0.0.1", "", "", "")
+	got, err := ResolveKDC(context.Background(), "10.0.0.1", "", "", "", nil)
 	if err != nil || got != "10.0.0.1:88" {
 		t.Errorf("ResolveKDC(kdc) = %q, %v", got, err)
 	}
-	got, err = ResolveKDC(context.Background(), "", "10.0.0.2", "", "")
+	got, err = ResolveKDC(context.Background(), "", "10.0.0.2", "", "", nil)
 	if err != nil || got != "10.0.0.2:88" {
 		t.Errorf("ResolveKDC(dc-ip) = %q, %v", got, err)
 	}
-	got, err = ResolveKDC(context.Background(), "kdc.corp.local", "", "", "")
+	got, err = ResolveKDC(context.Background(), "kdc.corp.local", "", "", "", nil)
 	if err != nil || got != "kdc.corp.local:88" {
 		t.Errorf("ResolveKDC(host) = %q, %v", got, err)
 	}
 	// already has a port
-	got, err = ResolveKDC(context.Background(), "10.0.0.1:9999", "", "", "")
+	got, err = ResolveKDC(context.Background(), "10.0.0.1:9999", "", "", "", nil)
 	if err != nil || got != "10.0.0.1:9999" {
 		t.Errorf("ResolveKDC(host:port) = %q, %v", got, err)
 	}
 	// nothing to resolve with
-	if _, err = ResolveKDC(context.Background(), "", "", "", ""); err == nil {
+	if _, err = ResolveKDC(context.Background(), "", "", "", "", nil); err == nil {
 		t.Error("expected error with no KDC sources")
 	}
 }

@@ -15,26 +15,21 @@ import (
 //	explicit --kdc value → --dc-ip → DNS SRV via the configured nameserver → error
 //
 // The SRV lookups respect the existing --nameserver flag: queries are sent
-// to that server instead of the system resolver.
-func ResolveKDC(ctx context.Context, kdcFlag, dcIP, domain, nameserver string) (string, error) {
+// to that server instead of the system resolver. With a SOCKS5 dialer all
+// of those DNS queries go over TCP through the proxy.
+func ResolveKDC(ctx context.Context, kdcFlag, dcIP, domain, nameserver string, d Dialer) (string, error) {
 	if kdcFlag != "" {
-		return withDefaultPort(resolveOrSelf(ctx, kdcFlag, nameserver), 88), nil
+		return withDefaultPort(resolveOrSelf(ctx, kdcFlag, nameserver, d), 88), nil
 	}
 	if dcIP != "" {
-		return withDefaultPort(resolveOrSelf(ctx, dcIP, nameserver), 88), nil
+		return withDefaultPort(resolveOrSelf(ctx, dcIP, nameserver, d), 88), nil
 	}
 	if domain == "" {
 		return "", fmt.Errorf(
 			"cannot determine KDC: specify --kdc, --dc-ip or --domain for DNS SRV discovery")
 	}
 
-	r := &net.Resolver{PreferGo: true}
-	if nameserver != "" {
-		r.Dial = func(ctx context.Context, network, _ string) (net.Conn, error) {
-			d := &net.Dialer{}
-			return d.DialContext(ctx, network, net.JoinHostPort(nameserver, "53"))
-		}
-	}
+	r := NameserverResolver(nameserver, d)
 
 	realm := strings.ToUpper(domain)
 	// AD forest root DCs, then the realm fallback.
@@ -79,16 +74,11 @@ func resolveHost(ctx context.Context, r *net.Resolver, host string) string {
 // the krb5 config never depends on the system resolver. IP literals and
 // unresolvable names pass through unchanged (the dial error will name the
 // host clearly).
-func resolveOrSelf(ctx context.Context, host, nameserver string) string {
+func resolveOrSelf(ctx context.Context, host, nameserver string, d Dialer) string {
 	if net.ParseIP(host) != nil || nameserver == "" {
 		return host
 	}
-	r := &net.Resolver{
-		PreferGo: true,
-		Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
-			return (&net.Dialer{}).DialContext(ctx, network, net.JoinHostPort(nameserver, "53"))
-		},
-	}
+	r := NameserverResolver(nameserver, d)
 	cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	if ip := resolveHost(cctx, r, host); ip != "" {
