@@ -3,11 +3,13 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"net"
 	"os"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -27,6 +29,7 @@ import (
 	"github.com/RapStudent22/sqlz/internal/modules/sqlquery"
 	"github.com/RapStudent22/sqlz/internal/modules/tables"
 	"github.com/RapStudent22/sqlz/internal/mssql"
+	"github.com/RapStudent22/sqlz/internal/mssql/krb5auth"
 	"github.com/RapStudent22/sqlz/internal/runner"
 	"github.com/RapStudent22/sqlz/internal/socks5"
 )
@@ -46,6 +49,15 @@ var (
 	passwordVal string
 	authVal     string
 
+	realmVal    string
+	kdcVal      string
+	aesKeyVal   string
+	hashVal     string
+	ccacheVal   string
+	krbEtypeVal string
+	kvnoVal     int
+	sprayVal    string
+
 	dbNameVal string
 
 	sqlVal         string
@@ -57,6 +69,9 @@ var (
 	workersVal int
 
 	proxyVal string
+
+	// kdcResolved caches the getKDC() result for the run.
+	kdcResolved string
 )
 
 func init() {
@@ -81,6 +96,15 @@ func init() {
 	flag.StringVar(&domainVal, "domain", "", "")
 	flag.StringVar(&domainVal, "d", "", "")
 	flag.StringVar(&authVal, "auth", "sql", "")
+
+	flag.StringVar(&realmVal, "realm", "", "")
+	flag.StringVar(&kdcVal, "kdc", "", "")
+	flag.StringVar(&aesKeyVal, "aes-key", "", "")
+	flag.StringVar(&hashVal, "hash", "", "")
+	flag.StringVar(&ccacheVal, "ccache", "", "")
+	flag.StringVar(&krbEtypeVal, "krb-etype", "", "")
+	flag.IntVar(&kvnoVal, "kvno", 0, "")
+	flag.StringVar(&sprayVal, "spray", "", "")
 
 	flag.StringVar(&dbNameVal, "db", "master", "")
 
@@ -119,6 +143,18 @@ func main() {
 	// no colors in JSON mode or when piped
 	if jsonOutVal {
 		color.Disable()
+	}
+
+	if err := validateAuthFlags(); err != nil {
+		die(err)
+	}
+	if sprayVal != "" && cmd != "scan" {
+		die(fmt.Errorf("--spray is only supported by the scan command"))
+	}
+	// Resolve the KDC up front so a missing KDC fails loudly before any
+	// connection attempt, and every worker uses the same address.
+	if getAuth() == mssql.AuthKerberos {
+		getKDC()
 	}
 
 	switch cmd {
@@ -162,9 +198,118 @@ func getAuth() mssql.AuthType {
 	switch strings.ToLower(authVal) {
 	case "windows", "win":
 		return mssql.AuthWindows
+	case "kerberos", "krb":
+		return mssql.AuthKerberos
+	case "sspi":
+		return mssql.AuthSSPI
 	default:
 		return mssql.AuthSQL
 	}
+}
+
+// kerberosRealm returns --realm, defaulting to upper(--domain).
+func kerberosRealm() string {
+	if realmVal != "" {
+		return strings.ToUpper(realmVal)
+	}
+	return strings.ToUpper(domainVal)
+}
+
+// getKDC resolves the KDC once per run: --kdc → --dc-ip → DNS SRV via the
+// configured nameserver. Never touches /etc/krb5.conf.
+func getKDC() string {
+	if kdcResolved != "" {
+		return kdcResolved
+	}
+	ns := nsVal
+	if ns == "" {
+		ns = getDC()
+	}
+	kdc, err := krb5auth.ResolveKDC(context.Background(), kdcVal, getDC(), domainVal, ns)
+	if err != nil {
+		die(err)
+	}
+	kdcResolved = kdc
+	return kdc
+}
+
+// validateAuthFlags checks flag combinations before any work starts.
+// Conflicting flags are an explicit error, never silently ignored.
+func validateAuthFlags() error {
+	auth := getAuth()
+	krbMaterial := 0
+	if passwordVal != "" {
+		krbMaterial++
+	}
+	if aesKeyVal != "" {
+		krbMaterial++
+	}
+	if hashVal != "" {
+		krbMaterial++
+	}
+	if ccacheVal != "" {
+		krbMaterial++
+	}
+
+	krbOnlyFlags := aesKeyVal != "" || hashVal != "" || ccacheVal != "" || krbEtypeVal != "" || kvnoVal != 0
+	if auth != mssql.AuthKerberos {
+		if krbOnlyFlags {
+			return fmt.Errorf("--aes-key, --hash, --ccache, --kvno and --krb-etype require --auth kerberos")
+		}
+		if auth == mssql.AuthSSPI && runtime.GOOS != "windows" {
+			return fmt.Errorf("--auth sspi requires Windows")
+		}
+		return nil
+	}
+
+	if sprayVal != "" && krbMaterial > 0 {
+		return fmt.Errorf("--spray cannot be combined with --password, --aes-key, --hash or --ccache")
+	}
+	// Windows without any credential material falls back to SSPI (native
+	// Kerberos via the session token), so no username is required there.
+	sspiFallback := krbMaterial == 0 && sprayVal == "" && runtime.GOOS == "windows"
+	if usernameVal == "" && ccacheVal == "" && sprayVal == "" && !sspiFallback {
+		return fmt.Errorf("--auth kerberos requires --username, --spray or --ccache")
+	}
+	if krbMaterial == 0 && sprayVal == "" && runtime.GOOS != "windows" {
+		return fmt.Errorf("--auth kerberos requires --password, --aes-key, --hash or --ccache on %s", runtime.GOOS)
+	}
+	if krbMaterial > 1 {
+		return fmt.Errorf("--password, --aes-key, --hash and --ccache are mutually exclusive")
+	}
+	if aesKeyVal != "" {
+		if _, err := hex.DecodeString(aesKeyVal); err != nil {
+			return fmt.Errorf("--aes-key must be hex")
+		}
+		if len(aesKeyVal) != 32 && len(aesKeyVal) != 64 {
+			return fmt.Errorf("--aes-key must be 32 hex chars (AES128) or 64 hex chars (AES256), got %d", len(aesKeyVal))
+		}
+	}
+	if hashVal != "" {
+		h := hashVal
+		if strings.Contains(h, ":") {
+			parts := strings.Split(h, ":")
+			if len(parts) != 2 {
+				return fmt.Errorf("--hash must be an NT hash (32 hex) or lm:nt pair")
+			}
+			h = parts[1]
+		}
+		if len(h) != 32 {
+			return fmt.Errorf("--hash must be an NT hash of 32 hex chars, got %d", len(h))
+		}
+		if _, err := hex.DecodeString(h); err != nil {
+			return fmt.Errorf("--hash must be hex")
+		}
+	}
+	if ccacheVal != "" {
+		if _, err := os.Stat(ccacheVal); err != nil {
+			return fmt.Errorf("--ccache: %w", err)
+		}
+	}
+	if kvnoVal < 0 || kvnoVal > 255 {
+		return fmt.Errorf("--kvno must be between 1 and 255")
+	}
+	return nil
 }
 
 func getDialer() mssql.Dialer {
@@ -298,8 +443,16 @@ func parseTarget(s string) (models.SQLInstance, error) {
 	return models.SQLInstance{Hostname: s, Port: 1433}, nil
 }
 
+// loadSpray parses the --spray credentials file, if given.
+func loadSpray() ([]connectiontest.SprayCred, error) {
+	if sprayVal == "" {
+		return nil, nil
+	}
+	return connectiontest.ParseSprayFile(sprayVal)
+}
+
 func runnerCfg() runner.Config {
-	return runner.Config{
+	cfg := runner.Config{
 		Workers:  workersVal,
 		Username: usernameVal,
 		Password: passwordVal,
@@ -307,7 +460,17 @@ func runnerCfg() runner.Config {
 		AuthType: getAuth(),
 		Database: dbNameVal,
 		Dialer:   getDialer(),
+		Realm:    kerberosRealm(),
+		AESKey:   aesKeyVal,
+		Hash:     hashVal,
+		CCache:   ccacheVal,
+		KrbEType: krbEtypeVal,
+		KVNO:     kvnoVal,
 	}
+	if cfg.AuthType == mssql.AuthKerberos {
+		cfg.KDC = getKDC()
+	}
+	return cfg
 }
 
 func getClient() (*mssql.Client, models.SQLInstance, error) {
@@ -319,6 +482,16 @@ func getClient() (*mssql.Client, models.SQLInstance, error) {
 		return nil, models.SQLInstance{}, fmt.Errorf("no instances found")
 	}
 	inst := instances[0]
+
+	spn, kdc := "", ""
+	if getAuth() == mssql.AuthKerberos {
+		spn, err = mssql.SPNForInstance(inst)
+		if err != nil {
+			return nil, inst, err
+		}
+		kdc = getKDC()
+	}
+
 	client, err := mssql.New(mssql.Config{
 		Server:   inst.ConnectionHost(),
 		Port:     inst.Port,
@@ -328,6 +501,14 @@ func getClient() (*mssql.Client, models.SQLInstance, error) {
 		Database: dbNameVal,
 		AuthType: getAuth(),
 		Dialer:   getDialer(),
+		Realm:    kerberosRealm(),
+		KDC:      kdc,
+		SPN:      spn,
+		AESKey:   aesKeyVal,
+		Hash:     hashVal,
+		CCache:   ccacheVal,
+		KrbEType: krbEtypeVal,
+		KVNO:     kvnoVal,
 	})
 	if err != nil {
 		return nil, inst, fmt.Errorf("connect %s: %w", inst.Address(), err)
@@ -418,16 +599,30 @@ func runScan() {
 		color.Count(fmt.Sprintf("%d", workersVal)))
 
 	type scanRow struct {
-		Host         string `json:"host"`
-		Port         int    `json:"port"`
-		Auth         bool   `json:"authenticated"`
-		ForceEncrypt *bool  `json:"force_encrypt,omitempty"`
-		Encrypt      string `json:"encrypt,omitempty"`
-		Version      string `json:"version,omitempty"`
-		Error        string `json:"error,omitempty"`
+		Host             string `json:"host"`
+		Port             int    `json:"port"`
+		Auth             bool   `json:"authenticated"`
+		Login            string `json:"login,omitempty"`
+		AuthMethod       string `json:"auth_method,omitempty"`
+		KerberosRequired bool   `json:"kerberos_required,omitempty"`
+		Hint             string `json:"auth_hint,omitempty"`
+		ForceEncrypt     *bool  `json:"force_encrypt,omitempty"`
+		Encrypt          string `json:"encrypt,omitempty"`
+		Version          string `json:"version,omitempty"`
+		Error            string `json:"error,omitempty"`
 	}
 	var all []scanRow
 	ok := 0
+
+	sprayCreds, err := loadSpray()
+	if err != nil {
+		die(err)
+	}
+
+	kdc := ""
+	if getAuth() == mssql.AuthKerberos {
+		kdc = getKDC()
+	}
 
 	connectiontest.Run(instances, connectiontest.Options{
 		Workers:  workersVal,
@@ -436,19 +631,31 @@ func runScan() {
 		Domain:   domainVal,
 		AuthType: getAuth(),
 		Dialer:   getDialer(),
+		Realm:    kerberosRealm(),
+		KDC:      kdc,
+		AESKey:   aesKeyVal,
+		Hash:     hashVal,
+		CCache:   ccacheVal,
+		KrbEType: krbEtypeVal,
+		KVNO:     kvnoVal,
+		Spray:    sprayCreds,
 	}, func(r connectiontest.Result) {
 		errStr := ""
 		if r.Error != nil {
 			errStr = r.Error.Error()
 		}
 		all = append(all, scanRow{
-			Host:         r.Instance.Hostname,
-			Port:         r.Instance.Port,
-			Auth:         r.Authenticated,
-			ForceEncrypt: r.ForceEncrypt,
-			Encrypt:      r.Encrypt.String(),
-			Version:      r.Version,
-			Error:        errStr,
+			Host:             r.Instance.Hostname,
+			Port:             r.Instance.Port,
+			Auth:             r.Authenticated,
+			Login:            r.Login,
+			AuthMethod:       r.AuthMethod,
+			KerberosRequired: r.KerberosRequired,
+			Hint:             r.Hint,
+			ForceEncrypt:     r.ForceEncrypt,
+			Encrypt:          r.Encrypt.String(),
+			Version:          r.Version,
+			Error:            errStr,
 		})
 		if r.Authenticated {
 			ok++
@@ -456,17 +663,29 @@ func runScan() {
 		if !jsonOutVal {
 			encStr := formatEncrypt(r.ForceEncrypt, r.Encrypt)
 			if r.Authenticated {
-				fmt.Printf("%s %s   %s   %s   %s\n",
+				method := r.AuthMethod
+				if method != "" {
+					method = color.Dim("[" + method + "]")
+				}
+				fmt.Printf("%s %s   %s   %s   %s   %s\n",
 					color.OK("[OK]"),
 					hostStr(r.Instance.Hostname, r.Instance.Port),
 					color.Bold(r.Login),
+					method,
 					formatRoles(r.Roles),
 					encStr)
 			} else {
-				fmt.Printf("%s %s   %s\n",
+				line := fmt.Sprintf("%s %s   %s",
 					color.Fail("[FAIL]"),
 					hostStr(r.Instance.Hostname, r.Instance.Port),
 					encStr)
+				if r.KerberosRequired {
+					line += "   " + color.Danger("[kerberos required]")
+				}
+				if r.Hint != "" {
+					line += "   " + color.Dim("("+r.Hint+")")
+				}
+				fmt.Println(line)
 			}
 		}
 	})
@@ -814,7 +1033,7 @@ func runLogins() {
 			name := l.Name
 			disabled := color.Good("false") // active login — green
 			if l.Disabled {
-				name = color.Dim(l.Name)     // disabled — grey out the name too
+				name = color.Dim(l.Name) // disabled — grey out the name too
 				disabled = color.Dim("true")
 			}
 			fmt.Fprintf(w, "    %s\t%s\t%s\t%s\n",
@@ -898,7 +1117,16 @@ Auth:
   -u, --username    Username
   -p, --password    Password
   -d, --domain      Domain
-      --auth        Auth type: sql (default) | windows
+      --auth        Auth type: sql (default) | windows | kerberos | sspi
+
+Kerberos (--auth kerberos):
+      --realm       Kerberos realm (default: upper(--domain))
+      --kdc         KDC IP/host (default: --dc-ip, then DNS SRV via --nameserver)
+      --aes-key     AES key for pass-the-key (32 hex = AES128, 64 hex = AES256)
+      --hash        NT hash (32 hex) or lm:nt pair for pass-the-hash
+      --ccache      Credential cache file (explicit path only)
+      --krb-etype   Force encryption type(s): aes256,aes128,rc4
+      --kvno        Key version number (default: 1)
 
 Options:
       --db            Database (default: master)
@@ -909,6 +1137,8 @@ Options:
   -j, --json          JSON output
   -w, --workers       Concurrency (default: 50)
   -x, --proxy         SOCKS5 proxy (e.g. socks5://127.0.0.1:1080)
+      --spray         Credentials file for spray mode (scan only):
+                        user:password | user:32-hex | user:32-hex:32-hex | user:64-hex
 
 Examples:
   # Discovery via domain
@@ -916,6 +1146,14 @@ Examples:
 
   # Scan a single host
   sqlz scan -H 10.0.0.5 -u sa -p Password1
+
+  # Kerberos auth (zero system config — works on stock Kali)
+  sqlz scan -H sql01.corp.local -d corp.local -u user -p pass --auth kerberos -dc 10.0.0.1
+  sqlz query -H sql01.corp.local -d corp.local -u user --aes-key <64-hex> --auth kerberos -dc 10.0.0.1 "SELECT @@VERSION"
+  sqlz scan -H sql01.corp.local -d corp.local -u user --hash <32-hex> --auth kerberos -dc 10.0.0.1
+
+  # Spray mode: try every pair, stop on first success per host
+  sqlz scan -t targets.txt -d corp.local --auth kerberos -dc 10.0.0.1 --spray creds.txt
 
   # Scan from file (host:port per line)
   sqlz scan -t targets.txt -u sa -p Password1
@@ -933,8 +1171,8 @@ Examples:
   sqlz scan -H 10.0.0.5 -u sa -p Password1 --proxy socks5://127.0.0.1:1080
   sqlz discover -dc 10.0.0.1 -d corp.local -u user -p pass -x socks5://127.0.0.1:1080
 
-`)}
-
+`)
+}
 
 // ---- utils ----
 

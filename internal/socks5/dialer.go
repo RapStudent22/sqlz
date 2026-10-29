@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Dialer routes TCP connections through a SOCKS5 proxy.
@@ -58,10 +59,17 @@ func (d *Dialer) DialContext(ctx context.Context, network, addr string) (net.Con
 	if err != nil {
 		return nil, fmt.Errorf("socks5: dial proxy %s: %w", d.proxyAddr, err)
 	}
+	// Propagate context deadline into the SOCKS5 handshake so negotiate()
+	// doesn't hang indefinitely if the proxy stops responding mid-handshake.
+	if deadline, ok := ctx.Deadline(); ok {
+		conn.SetDeadline(deadline)
+	}
 	if err := negotiate(conn, addr, d.username, d.password); err != nil {
 		conn.Close()
 		return nil, err
 	}
+	// Clear deadline — callers set their own I/O deadlines after this.
+	conn.SetDeadline(time.Time{})
 	return conn, nil
 }
 

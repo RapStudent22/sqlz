@@ -15,6 +15,15 @@ type Config struct {
 	AuthType mssql.AuthType
 	Database string
 	Dialer   mssql.Dialer
+
+	// Kerberos options.
+	Realm    string
+	KDC      string
+	AESKey   string
+	Hash     string
+	CCache   string
+	KrbEType string
+	KVNO     int
 }
 
 type Result[T any] struct {
@@ -50,6 +59,14 @@ func Run[T any](
 				Database: cfg.Database,
 				AuthType: cfg.AuthType,
 				Dialer:   cfg.Dialer,
+				Realm:    cfg.Realm,
+				KDC:      cfg.KDC,
+				SPN:      spnFor(cfg.AuthType, inst, &r),
+				AESKey:   cfg.AESKey,
+				Hash:     cfg.Hash,
+				CCache:   cfg.CCache,
+				KrbEType: cfg.KrbEType,
+				KVNO:     cfg.KVNO,
 			})
 			if err != nil {
 				r.Error = err.Error()
@@ -92,4 +109,18 @@ func Run[T any](
 		results = append(results, r)
 	}
 	return results
+}
+
+// spnFor builds the Kerberos SPN for an instance. On failure it records the
+// error on the result and returns "" so the caller reports and skips.
+func spnFor[T any](auth mssql.AuthType, inst models.SQLInstance, r *Result[T]) string {
+	if auth != mssql.AuthKerberos {
+		return ""
+	}
+	spn, err := mssql.SPNForInstance(inst)
+	if err != nil {
+		r.Error = err.Error()
+		return ""
+	}
+	return spn
 }

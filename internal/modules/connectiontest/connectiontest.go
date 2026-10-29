@@ -3,6 +3,7 @@ package connectiontest
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"time"
 
@@ -18,6 +19,19 @@ type Options struct {
 	Domain   string
 	AuthType mssql.AuthType
 	Dialer   mssql.Dialer
+
+	// Kerberos options.
+	Realm    string
+	KDC      string
+	AESKey   string
+	Hash     string
+	CCache   string
+	KrbEType string
+	KVNO     int
+
+	// Spray, when non-empty, tries each credential in order per host and
+	// stops on first success (stop-on-success).
+	Spray []SprayCred
 }
 
 type Result struct {
@@ -25,8 +39,14 @@ type Result struct {
 	Authenticated bool
 	Version       string
 	Login         string
-	Roles         []string // active server roles, e.g. ["sysadmin", "dbcreator"]
+	AuthMethod    string // "password" | "hash" | "aes-key" when sprayed
+	Roles         []string
 	Error         error
+	// Hint explains the failure, e.g. "NTLM blocked — retry with --auth kerberos".
+	Hint string
+	// KerberosRequired is true when NTLM is blocked and Kerberos is the only
+	// auth option for the account.
+	KerberosRequired bool
 	// ForceEncrypt is nil when the TDS pre-login check failed, otherwise true/false.
 	ForceEncrypt *bool
 	Encrypt      relaycheck.EncryptMode
@@ -56,61 +76,126 @@ func testOne(inst models.SQLInstance, opts Options) Result {
 		forceEncrypt = &fe
 	}
 
-	client, err := mssql.New(mssql.Config{
+	// Kerberos needs an SPN: build it once per host.
+	spn := ""
+	if authType == mssql.AuthKerberos {
+		var err error
+		spn, err = mssql.SPNForInstance(inst)
+		if err != nil {
+			return Result{Instance: inst, Error: err, ForceEncrypt: forceEncrypt, Encrypt: rc.Encrypt}
+		}
+	}
+
+	base := mssql.Config{
 		Server:   inst.ConnectionHost(),
 		Port:     inst.Port,
-		Username: opts.Username,
-		Password: opts.Password,
 		Domain:   opts.Domain,
 		AuthType: authType,
 		Dialer:   opts.Dialer,
-	})
-	if err != nil {
-		return Result{Instance: inst, Error: err}
+		Realm:    opts.Realm,
+		KDC:      opts.KDC,
+		SPN:      spn,
+		KrbEType: opts.KrbEType,
+		KVNO:     opts.KVNO,
 	}
-	defer client.Close()
 
-	cr := client.TestConnectionWithVersion(inst)
-	if !cr.Authenticated {
-		var connErr error
-		if cr.Error != "" {
-			connErr = errors.New(cr.Error)
+	// credential set: spray list or the single set of flags
+	type cred struct {
+		method string
+		cfg    mssql.Config
+	}
+	var creds []cred
+	if len(opts.Spray) > 0 {
+		for _, sc := range opts.Spray {
+			cfg := base
+			cfg.Username = sc.Username
+			cfg.Password, cfg.AESKey, cfg.Hash = "", "", ""
+			switch sc.Method {
+			case "password":
+				cfg.Password = sc.Secret
+			case "hash":
+				cfg.Hash = sc.Secret
+			case "aes-key":
+				cfg.AESKey = sc.Secret
+			}
+			creds = append(creds, cred{method: sc.Method, cfg: cfg})
 		}
-		return Result{Instance: inst, Error: connErr, ForceEncrypt: forceEncrypt, Encrypt: rc.Encrypt}
+	} else {
+		cfg := base
+		cfg.Username, cfg.Password = opts.Username, opts.Password
+		cfg.AESKey, cfg.Hash, cfg.CCache = opts.AESKey, opts.Hash, opts.CCache
+		creds = append(creds, cred{cfg: cfg})
 	}
 
-	result := Result{
-		Instance:      inst,
-		Authenticated: true,
-		Version:       cr.Version,
-		ForceEncrypt:  forceEncrypt,
-		Encrypt:       rc.Encrypt,
-	}
+	var lastErr error
+	for _, c := range creds {
+		// hash / AES-key pairs only work over Kerberos
+		if authType != mssql.AuthKerberos && c.method != "" && c.method != "password" {
+			lastErr = fmt.Errorf("spray entry %q requires --auth kerberos", c.method)
+			continue
+		}
 
-	// query login name + key server roles
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
+		client, err := mssql.New(c.cfg)
+		if err != nil {
+			lastErr = err
+			continue
+		}
 
-	rows, err := client.Query(ctx, `
-		SELECT
-			SYSTEM_USER                          AS login,
-			IS_SRVROLEMEMBER('sysadmin')         AS sysadmin,
-			IS_SRVROLEMEMBER('serveradmin')      AS serveradmin,
-			IS_SRVROLEMEMBER('securityadmin')    AS securityadmin,
-			IS_SRVROLEMEMBER('dbcreator')        AS dbcreator,
-			IS_SRVROLEMEMBER('bulkadmin')        AS bulkadmin
-	`)
-	if err == nil && len(rows) > 0 {
-		row := rows[0]
-		result.Login, _ = row["login"].(string)
-		for _, r := range roleOrder {
-			if intVal(row, r.key) == 1 {
-				result.Roles = append(result.Roles, r.label)
+		cr := client.TestConnectionWithVersion(inst)
+		if !cr.Authenticated {
+			client.Close()
+			if cr.Error != "" {
+				lastErr = errors.New(cr.Error)
+			}
+			continue
+		}
+
+		result := Result{
+			Instance:      inst,
+			Authenticated: true,
+			Version:       cr.Version,
+			ForceEncrypt:  forceEncrypt,
+			Encrypt:       rc.Encrypt,
+		}
+		if c.method != "" {
+			result.AuthMethod = c.method
+		}
+
+		// query login name + key server roles
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		rows, err := client.Query(ctx, `
+			SELECT
+				SYSTEM_USER                          AS login,
+				IS_SRVROLEMEMBER('sysadmin')         AS sysadmin,
+				IS_SRVROLEMEMBER('serveradmin')      AS serveradmin,
+				IS_SRVROLEMEMBER('securityadmin')    AS securityadmin,
+				IS_SRVROLEMEMBER('dbcreator')        AS dbcreator,
+				IS_SRVROLEMEMBER('bulkadmin')        AS bulkadmin
+		`)
+		cancel()
+		client.Close()
+
+		if err == nil && len(rows) > 0 {
+			row := rows[0]
+			result.Login, _ = row["login"].(string)
+			for _, r := range roleOrder {
+				if intVal(row, r.key) == 1 {
+					result.Roles = append(result.Roles, r.label)
+				}
 			}
 		}
+
+		return result
 	}
 
-	return result
+	res := Result{
+		Instance:     inst,
+		Error:        lastErr,
+		ForceEncrypt: forceEncrypt,
+		Encrypt:      rc.Encrypt,
+	}
+	res.KerberosRequired, res.Hint = mssql.LoginHint(authType, lastErr)
+	return res
 }
 
 func Run(instances []models.SQLInstance, opts Options, cb ResultCallback) []Result {
@@ -128,8 +213,8 @@ func Run(instances []models.SQLInstance, opts Options, cb ResultCallback) []Resu
 		defer wg.Done()
 		for inst := range jobs {
 			r := testOne(inst, opts)
-			cb(r)
 			mu.Lock()
+			cb(r)
 			results = append(results, r)
 			mu.Unlock()
 		}
