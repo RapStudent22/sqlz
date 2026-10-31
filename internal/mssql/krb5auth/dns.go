@@ -1,8 +1,10 @@
 package krb5auth
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"math/rand"
@@ -95,6 +97,50 @@ func nsAddr(ns string) string {
 	return net.JoinHostPort(ns, "53")
 }
 
+// errTruncated signals a UDP response with the TC bit set: without EDNS0
+// the server truncates answers at 512 bytes, and the full answer must be
+// re-queried over TCP.
+var errTruncated = errors.New("dns: truncated response")
+
+// checkDNSResponse validates a response packet against the query:
+// transaction ID, QR bit, RCODE and the TC (truncation) bit.
+func checkDNSResponse(query, resp []byte) error {
+	if len(resp) < 12 {
+		return fmt.Errorf("dns: short response (%d bytes)", len(resp))
+	}
+	if !bytes.Equal(resp[:2], query[:2]) {
+		return fmt.Errorf("dns: response ID mismatch (got 0x%04x, want 0x%04x)",
+			binary.BigEndian.Uint16(resp[:2]), binary.BigEndian.Uint16(query[:2]))
+	}
+	if resp[2]&0x80 == 0 {
+		return fmt.Errorf("dns: packet is not a response (QR=0)")
+	}
+	if code := resp[3] & 0x0F; code != 0 {
+		return fmt.Errorf("dns: server error %s (rcode %d)", rcodeName(code), code)
+	}
+	if resp[2]&0x02 != 0 {
+		return errTruncated
+	}
+	return nil
+}
+
+// rcodeName maps a DNS response code to its mnemonic.
+func rcodeName(code byte) string {
+	switch code {
+	case 1:
+		return "FORMERR"
+	case 2:
+		return "SERVFAIL"
+	case 3:
+		return "NXDOMAIN"
+	case 4:
+		return "NOTIMP"
+	case 5:
+		return "REFUSED"
+	}
+	return "UNKNOWN"
+}
+
 // dnsQuery builds a query for qname/qtype, sends it over UDP first and
 // falls back to TCP, and returns the response message.
 func dnsQuery(ctx context.Context, ns, qname string, qtype uint16, d Dialer) ([]byte, error) {
@@ -107,9 +153,13 @@ func dnsQuery(ctx context.Context, ns, qname string, qtype uint16, d Dialer) ([]
 		return dnsTCPExchange(ctx, ns, q, d)
 	}
 
-	// UDP first
+	// UDP first; a truncated (TC) answer is re-queried over TCP.
 	if resp, err := dnsUDPExchange(ctx, ns, q); err == nil {
-		return resp, nil
+		if verr := checkDNSResponse(q, resp); verr == nil {
+			return resp, nil
+		} else if verr != errTruncated {
+			return nil, verr
+		}
 	}
 	return dnsTCPExchange(ctx, ns, q, nil)
 }
@@ -182,6 +232,9 @@ func dnsTCPExchange(ctx context.Context, ns string, q []byte, d Dialer) ([]byte,
 	}
 	resp := make([]byte, binary.BigEndian.Uint16(hdr))
 	if _, err := io.ReadFull(conn, resp); err != nil {
+		return nil, err
+	}
+	if err := checkDNSResponse(q, resp); err != nil {
 		return nil, err
 	}
 	return resp, nil

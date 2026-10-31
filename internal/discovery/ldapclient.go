@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"strconv"
 	"strings"
 	"time"
 
@@ -113,6 +114,17 @@ func pagingCookie(controls *ber.Packet) []byte {
 	return nil
 }
 
+// resultCode extracts the Enumerated result code from a BindResponse /
+// SearchResultDone packet. ok is false when the packet has no Enumerated
+// child (malformed or truncated response).
+func resultCode(op *ber.Packet) (code int64, ok bool) {
+	if len(op.Children) == 0 || op.Children[0].Tag != ber.TagEnumerated {
+		return 0, false
+	}
+	code, ok = op.Children[0].Value.(int64)
+	return code, ok
+}
+
 // bind performs the SASL GSS-SPNEGO bind with the SPNEGO token built from
 // the Kerberos client.
 func (l *ldapConn) bindSASL(spnegoToken []byte, username string) error {
@@ -133,16 +145,18 @@ func (l *ldapConn) bindSASL(spnegoToken []byte, username string) error {
 		return err
 	}
 	// BindResponse: [0] result code, [1] matched DN, [2] diagnostic message
-	if len(op.Children) > 0 && op.Children[0].Tag == ber.TagEnumerated {
-		if code, ok := op.Children[0].Value.(int64); ok && code == 0 {
-			return nil
-		}
+	code, ok := resultCode(op)
+	if ok && code == 0 {
+		return nil
 	}
 	diag := ""
 	if len(op.Children) > 2 && op.Children[2].Value != nil {
 		diag = fmt.Sprintf(": %v", op.Children[2].Value)
 	}
-	return fmt.Errorf("ldap bind failed: result %v%s", op.Children[0].Value, diag)
+	if ok {
+		return fmt.Errorf("ldap bind failed: result %d%s", code, diag)
+	}
+	return fmt.Errorf("ldap bind failed: malformed BindResponse%s", diag)
 }
 
 // search runs a paged subtree search for SPNs and returns the collected
@@ -203,6 +217,13 @@ func (l *ldapConn) searchSPNs(baseDN, filter string) ([]string, error) {
 				}
 			case 19: // SearchResultReference — ignore
 			case 5: // SearchResultDone
+				// A non-zero result code (sizeLimitExceeded=4,
+				// adminLimitExceeded=11, insufficientAccessRights=50, ...)
+				// means the search was cut short — report it instead of
+				// silently returning a partial/empty result.
+				if code, ok := resultCode(op); ok && code != 0 {
+					return nil, fmt.Errorf("ldap search failed: result %d", code)
+				}
 				cookie = pagingCookie(controls)
 				done = true
 			default:
@@ -272,7 +293,9 @@ func kerberosDiscover(cfg LDAPConfig) ([]models.SQLInstance, error) {
 
 	var raw net.Conn
 	if cfg.Dialer != nil {
-		raw, err = cfg.Dialer.DialContext(context.Background(), "tcp", address)
+		dctx, cancel := context.WithTimeout(context.Background(), ldapDialTimeout)
+		raw, err = cfg.Dialer.DialContext(dctx, "tcp", address)
+		cancel()
 	} else {
 		raw, err = (&net.Dialer{Timeout: 10 * time.Second}).DialContext(context.Background(), "tcp", address)
 	}
@@ -365,13 +388,16 @@ func instancesFromSPNs(spns []string) []models.SQLInstance {
 			Port:     1433,
 		}
 		if len(parts) == 2 {
-			var p int
-			fmt.Sscanf(parts[1], "%d", &p)
-			if p > 0 {
+			if p, err := strconv.Atoi(parts[1]); err == nil && p > 0 {
 				instance.Port = p
+			} else if parts[1] != "" {
+				// MSSQLSvc/host:InstanceName — a named instance: its port
+				// is only known via the SQL Browser, so the instance name
+				// is kept and the port stays 1433.
+				instance.Instance = parts[1]
 			}
 		}
-		key := instance.Hostname + ":" + fmt.Sprint(instance.Port)
+		key := strings.ToLower(instance.Hostname) + ":" + fmt.Sprint(instance.Port)
 		if !seen[key] {
 			seen[key] = true
 			results = append(results, instance)

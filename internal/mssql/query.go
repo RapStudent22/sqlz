@@ -3,7 +3,6 @@ package mssql
 import (
 	"context"
 	"database/sql"
-	"fmt"
 	"time"
 )
 
@@ -64,22 +63,13 @@ func (c *Client) Query(
 		results = append(results, row)
 	}
 
+	// Iteration errors (broken row stream, killed query) must surface
+	// instead of silently returning a partial result.
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
 	return results, nil
-}
-
-func (c *Client) QuerySimple(
-	query string,
-	args ...any,
-) ([]map[string]any, error) {
-
-	ctx, cancel := context.WithTimeout(
-		context.Background(),
-		c.config.QueryTimeout,
-	)
-
-	defer cancel()
-
-	return c.Query(ctx, query, args...)
 }
 
 func (c *Client) QueryRow(
@@ -104,23 +94,4 @@ func (c *Client) Exec(
 
 	_, err := c.db.ExecContext(ctx, query, args...)
 	return err
-}
-
-func (c *Client) QueryValue(
-	query string,
-	args ...any,
-) (string, error) {
-
-	var value sql.NullString
-
-	err := c.db.QueryRow(query, args...).Scan(&value)
-	if err != nil {
-		return "", err
-	}
-
-	if !value.Valid {
-		return "", fmt.Errorf("null value")
-	}
-
-	return value.String, nil
 }

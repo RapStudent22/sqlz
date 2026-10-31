@@ -66,9 +66,14 @@ var (
 	revertShellVal bool
 
 	jsonOutVal bool
+	verboseVal bool
 	workersVal int
 
 	proxyVal string
+
+	// positionalArgs holds the non-flag arguments after splitArgs (see
+	// main); positionalOrFlag falls back to them.
+	positionalArgs []string
 
 	// kdcResolved caches the getKDC() result for the run.
 	kdcResolved string
@@ -117,6 +122,8 @@ func init() {
 
 	flag.BoolVar(&jsonOutVal, "json", false, "")
 	flag.BoolVar(&jsonOutVal, "j", false, "")
+	flag.BoolVar(&verboseVal, "verbose", false, "")
+	flag.BoolVar(&verboseVal, "v", false, "")
 	flag.IntVar(&workersVal, "workers", 50, "")
 	flag.IntVar(&workersVal, "w", 50, "")
 
@@ -138,7 +145,14 @@ func main() {
 		return
 	}
 
-	flag.CommandLine.Parse(os.Args[2:])
+	// The std flag package stops at the first positional argument, so
+	// `sqlz query -H 10.0.0.5 -u sa -p Password1 "SELECT @@VERSION" -j`
+	// would silently join "-j" into the query text. Split the args first:
+	// flag tokens (plus the values of value-taking flags) go to the flag
+	// parser, everything else is kept as positional arguments.
+	flagArgs, pos := splitArgs(os.Args[2:])
+	positionalArgs = pos
+	flag.CommandLine.Parse(flagArgs)
 
 	// no colors in JSON mode or when piped
 	if jsonOutVal {
@@ -168,8 +182,10 @@ func main() {
 		}
 	}
 	// Resolve the KDC up front so a missing KDC fails loudly before any
-	// connection attempt, and every worker uses the same address.
-	if getAuth() == mssql.AuthKerberos {
+	// connection attempt, and every worker uses the same address. Skipped
+	// for the Windows SSPI fallback: winsspi uses the session token and
+	// never touches gokrb5 or a KDC.
+	if getAuth() == mssql.AuthKerberos && !sspiFallback() {
 		getKDC()
 	}
 
@@ -202,6 +218,53 @@ func main() {
 }
 
 // ---- connection helpers ----
+
+// splitArgs separates flag tokens from positional arguments before the
+// standard flag parser runs. The flag package stops parsing at the first
+// positional token, so trailing flags (`"SELECT @@VERSION" -j`) would be
+// silently joined into the query text otherwise. A "-"-prefixed token that
+// names no known flag is treated as a flag only before the first positional
+// argument — afterwards it is positional (e.g. "SELECT -1").
+func splitArgs(args []string) (flagArgs, positional []string) {
+	sawPositional := false
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if a == "--" {
+			positional = append(positional, args[i+1:]...)
+			return flagArgs, positional
+		}
+		if !strings.HasPrefix(a, "-") || a == "-" {
+			positional = append(positional, a)
+			sawPositional = true
+			continue
+		}
+		name := strings.TrimLeft(a, "-")
+		if eq := strings.IndexByte(name, '='); eq >= 0 {
+			name = name[:eq]
+		}
+		f := flag.CommandLine.Lookup(name)
+		if f == nil {
+			if sawPositional {
+				positional = append(positional, a) // negative number in a query, etc.
+				continue
+			}
+			flagArgs = append(flagArgs, a) // let Parse report the unknown flag
+			continue
+		}
+		flagArgs = append(flagArgs, a)
+		if bf, ok := f.Value.(interface{ IsBoolFlag() bool }); ok && bf.IsBoolFlag() {
+			continue
+		}
+		if strings.Contains(a, "=") {
+			continue // value attached inline
+		}
+		if i+1 < len(args) {
+			i++
+			flagArgs = append(flagArgs, args[i]) // value-taking flag consumes the next token
+		}
+	}
+	return flagArgs, positional
+}
 
 func getDC() string {
 	if dcIPVal != "" {
@@ -249,6 +312,17 @@ func getKDC() string {
 	return kdc
 }
 
+// sspiFallback reports whether --auth kerberos without any credential
+// material falls back to native Windows SSPI, which uses the session token
+// and never needs a KDC (or a KDC relay through the proxy).
+func sspiFallback() bool {
+	if getAuth() != mssql.AuthKerberos {
+		return false
+	}
+	krbMaterial := passwordVal != "" || aesKeyVal != "" || hashVal != "" || ccacheVal != ""
+	return !krbMaterial && sprayVal == "" && runtime.GOOS == "windows"
+}
+
 // validateAuthFlags checks flag combinations before any work starts.
 // Conflicting flags are an explicit error, never silently ignored.
 func validateAuthFlags() error {
@@ -283,8 +357,7 @@ func validateAuthFlags() error {
 	}
 	// Windows without any credential material falls back to SSPI (native
 	// Kerberos via the session token), so no username is required there.
-	sspiFallback := krbMaterial == 0 && sprayVal == "" && runtime.GOOS == "windows"
-	if usernameVal == "" && ccacheVal == "" && sprayVal == "" && !sspiFallback {
+	if usernameVal == "" && ccacheVal == "" && sprayVal == "" && !sspiFallback() {
 		return fmt.Errorf("--auth kerberos requires --username, --spray or --ccache")
 	}
 	if krbMaterial == 0 && sprayVal == "" && runtime.GOOS != "windows" {
@@ -323,7 +396,7 @@ func validateAuthFlags() error {
 		}
 	}
 	if kvnoVal < 0 || kvnoVal > 255 {
-		return fmt.Errorf("--kvno must be between 1 and 255")
+		return fmt.Errorf("--kvno must be between 0 and 255 (0 = not set, defaults to 1)")
 	}
 	return nil
 }
@@ -360,7 +433,7 @@ func getInstances() ([]models.SQLInstance, error) {
 			ns = getDC()
 		}
 		kdc := ""
-		if getAuth() == mssql.AuthKerberos {
+		if getAuth() == mssql.AuthKerberos && !sspiFallback() {
 			kdc = getKDC()
 		}
 		instances, err = discovery.DiscoverSQLInstances(discovery.LDAPConfig{
@@ -414,6 +487,10 @@ func resolveInstances(instances []models.SQLInstance, ns string, d krb5auth.Dial
 		ip, err := krb5auth.LookupHostIP(ctx, ns, instances[i].Hostname, d)
 		cancel()
 		if err != nil {
+			if verboseVal {
+				fmt.Fprintf(os.Stderr, "%s cannot resolve %q via nameserver %s: %v — falling back to system DNS\n",
+					color.Warn("[!]"), instances[i].Hostname, ns, err)
+			}
 			continue
 		}
 		instances[i].ConnHost = ip
@@ -490,7 +567,7 @@ func runnerCfg() runner.Config {
 		KrbEType: krbEtypeVal,
 		KVNO:     kvnoVal,
 	}
-	if cfg.AuthType == mssql.AuthKerberos {
+	if cfg.AuthType == mssql.AuthKerberos && !sspiFallback() {
 		cfg.KDC = getKDC()
 	}
 	return cfg
@@ -507,7 +584,7 @@ func getClient() (*mssql.Client, models.SQLInstance, error) {
 	inst := instances[0]
 
 	spn, kdc := "", ""
-	if getAuth() == mssql.AuthKerberos {
+	if getAuth() == mssql.AuthKerberos && !sspiFallback() {
 		spn, err = mssql.SPNForInstance(inst)
 		if err != nil {
 			return nil, inst, err
@@ -555,8 +632,8 @@ func positionalOrFlag(flagVal string) string {
 	if flagVal != "" {
 		return flagVal
 	}
-	if args := flag.Args(); len(args) > 0 {
-		return strings.Join(args, " ")
+	if len(positionalArgs) > 0 {
+		return strings.Join(positionalArgs, " ")
 	}
 	return ""
 }
@@ -603,12 +680,27 @@ func runDiscover() {
 	fmt.Fprintln(w, color.Bold("HOST\tPORT\tSPN"))
 	fmt.Fprintln(w, color.Dim("----\t----\t---"))
 	for _, i := range instances {
-		fmt.Fprintf(w, "%s\t%d\t%s\n", i.Hostname, i.Port, color.Dim(i.SPN))
+		fmt.Fprintf(w, "%s\t%d\t%s\n", i.DisplayName(), i.Port, color.Dim(i.SPN))
 	}
 	w.Flush()
 }
 
 // ---- scan ----
+
+// scanRow is the JSON shape of one scan result.
+type scanRow struct {
+	Host             string `json:"host"`
+	Port             int    `json:"port"`
+	Auth             bool   `json:"authenticated"`
+	Login            string `json:"login,omitempty"`
+	AuthMethod       string `json:"auth_method,omitempty"`
+	KerberosRequired bool   `json:"kerberos_required,omitempty"`
+	Hint             string `json:"auth_hint,omitempty"`
+	ForceEncrypt     *bool  `json:"force_encrypt,omitempty"`
+	Encrypt          string `json:"encrypt,omitempty"`
+	Version          string `json:"version,omitempty"`
+	Error            string `json:"error,omitempty"`
+}
 
 func runScan() {
 	instances, err := getInstances()
@@ -621,20 +713,6 @@ func runScan() {
 		color.Count(fmt.Sprintf("%d", len(instances))),
 		color.Count(fmt.Sprintf("%d", workersVal)))
 
-	type scanRow struct {
-		Host             string `json:"host"`
-		Port             int    `json:"port"`
-		Auth             bool   `json:"authenticated"`
-		Login            string `json:"login,omitempty"`
-		AuthMethod       string `json:"auth_method,omitempty"`
-		KerberosRequired bool   `json:"kerberos_required,omitempty"`
-		Hint             string `json:"auth_hint,omitempty"`
-		ForceEncrypt     *bool  `json:"force_encrypt,omitempty"`
-		Encrypt          string `json:"encrypt,omitempty"`
-		Version          string `json:"version,omitempty"`
-		Error            string `json:"error,omitempty"`
-	}
-	var all []scanRow
 	ok := 0
 
 	sprayCreds, err := loadSpray()
@@ -649,11 +727,11 @@ func runScan() {
 	}
 
 	kdc := ""
-	if getAuth() == mssql.AuthKerberos {
+	if getAuth() == mssql.AuthKerberos && !sspiFallback() {
 		kdc = getKDC()
 	}
 
-	connectiontest.Run(instances, connectiontest.Options{
+	results := connectiontest.Run(instances, connectiontest.Options{
 		Workers:  workersVal,
 		Username: usernameVal,
 		Password: passwordVal,
@@ -669,57 +747,47 @@ func runScan() {
 		KVNO:     kvnoVal,
 		Spray:    sprayCreds,
 	}, func(r connectiontest.Result) {
-		errStr := ""
-		if r.Error != nil {
-			errStr = r.Error.Error()
+		if jsonOutVal {
+			return // JSON output is built from the ordered results below
 		}
-		all = append(all, scanRow{
-			Host:             r.Instance.Hostname,
-			Port:             r.Instance.Port,
-			Auth:             r.Authenticated,
-			Login:            r.Login,
-			AuthMethod:       r.AuthMethod,
-			KerberosRequired: r.KerberosRequired,
-			Hint:             r.Hint,
-			ForceEncrypt:     r.ForceEncrypt,
-			Encrypt:          r.Encrypt.String(),
-			Version:          r.Version,
-			Error:            errStr,
-		})
 		if r.Authenticated {
 			ok++
 		}
-		if !jsonOutVal {
-			encStr := formatEncrypt(r.ForceEncrypt, r.Encrypt)
-			if r.Authenticated {
-				method := r.AuthMethod
-				if method != "" {
-					method = color.Dim("[" + method + "]")
-				}
-				fmt.Printf("%s %s   %s   %s   %s   %s\n",
-					color.OK("[OK]"),
-					hostStr(r.Instance.Hostname, r.Instance.Port),
-					color.Bold(r.Login),
-					method,
-					formatRoles(r.Roles),
-					encStr)
-			} else {
-				line := fmt.Sprintf("%s %s   %s",
-					color.Fail("[FAIL]"),
-					hostStr(r.Instance.Hostname, r.Instance.Port),
-					encStr)
-				if r.KerberosRequired {
-					line += "   " + color.Danger("[kerberos required]")
-				}
-				if r.Hint != "" {
-					line += "   " + color.Dim("("+r.Hint+")")
-				}
-				fmt.Println(line)
+		encStr := formatEncrypt(r.ForceEncrypt, r.Encrypt)
+		if r.Authenticated {
+			method := r.AuthMethod
+			if method != "" {
+				method = color.Dim("[" + method + "]")
 			}
+			fmt.Printf("%s %s   %s   %s   %s   %s\n",
+				color.OK("[OK]"),
+				hostStr(r.Instance.Hostname, r.Instance.Port),
+				color.Bold(r.Login),
+				method,
+				formatRoles(r.Roles),
+				encStr)
+		} else {
+			line := fmt.Sprintf("%s %s   %s",
+				color.Fail("[FAIL]"),
+				hostStr(r.Instance.Hostname, r.Instance.Port),
+				encStr)
+			if r.KerberosRequired {
+				line += "   " + color.Danger("[kerberos required]")
+			}
+			if r.Hint != "" {
+				line += "   " + color.Dim("("+r.Hint+")")
+			}
+			fmt.Println(line)
 		}
 	})
 
 	if jsonOutVal {
+		// Results are already in input order (Run collects by index), so
+		// the JSON output is deterministic across runs.
+		all := make([]scanRow, 0, len(results))
+		for _, r := range results {
+			all = append(all, scanRowFromResult(r))
+		}
 		printJSON(all)
 		return
 	}
@@ -727,6 +795,32 @@ func runScan() {
 		color.OK("[+]"),
 		color.Count(fmt.Sprintf("%d", ok)),
 		len(instances))
+}
+
+// scanRowFromResult converts a connection-test result into the JSON scan
+// row. Encrypt is filled only when the pre-login check succeeded — a nil
+// ForceEncrypt would otherwise render as a misleading "ENCRYPT_OFF".
+func scanRowFromResult(r connectiontest.Result) scanRow {
+	errStr := ""
+	if r.Error != nil {
+		errStr = r.Error.Error()
+	}
+	row := scanRow{
+		Host:             r.Instance.Hostname,
+		Port:             r.Instance.Port,
+		Auth:             r.Authenticated,
+		Login:            r.Login,
+		AuthMethod:       r.AuthMethod,
+		KerberosRequired: r.KerberosRequired,
+		Hint:             r.Hint,
+		ForceEncrypt:     r.ForceEncrypt,
+		Version:          r.Version,
+		Error:            errStr,
+	}
+	if r.ForceEncrypt != nil {
+		row.Encrypt = r.Encrypt.String()
+	}
+	return row
 }
 
 // ---- info ----
@@ -1164,10 +1258,11 @@ Options:
       --enable-shell  Enable xp_cmdshell (requires sysadmin)
       --revert-shell  Disable xp_cmdshell after running
   -j, --json          JSON output
+  -v, --verbose       Verbose diagnostics (e.g. DNS resolution warnings)
   -w, --workers       Concurrency (default: 50)
   -x, --proxy         SOCKS5 proxy (e.g. socks5://127.0.0.1:1080)
       --spray         Credentials file for spray mode (scan only):
-                        user:password | user:32-hex | user:32-hex:32-hex | user:64-hex
+                        user:password | user:p:password | user:32-hex | user:32-hex:32-hex | user:64-hex
 
 Examples:
   # Discovery via domain

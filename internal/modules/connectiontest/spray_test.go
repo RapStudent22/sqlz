@@ -39,6 +39,17 @@ func TestParseSprayLine(t *testing.T) {
 		t.Errorf("aes method = %q", got.Method)
 	}
 
+	// the "p:" prefix forces password interpretation: a 32/64-hex password
+	// would otherwise be misdetected as a hash / AES key
+	hexPassword := strings.Repeat("ab", 16) // 32 hex chars
+	got, err = parseSprayLine("user5:p:" + hexPassword)
+	if err != nil {
+		t.Fatalf("p: prefix: %v", err)
+	}
+	if got.Method != "password" || got.Secret != hexPassword {
+		t.Errorf("p: entry = %+v, want password %q", got, hexPassword)
+	}
+
 	if _, err := parseSprayLine("nocolon"); err == nil {
 		t.Error("expected error for line without colon")
 	}

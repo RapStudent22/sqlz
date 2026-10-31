@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"strconv"
 	"strings"
 	"time"
 
@@ -18,6 +19,11 @@ import (
 type Dialer interface {
 	DialContext(ctx context.Context, network, addr string) (net.Conn, error)
 }
+
+// ldapDialTimeout bounds the proxy dial. Without a deadline, a dead SOCKS5
+// proxy hangs the run: the OS SYN timeouts take ~2 minutes and the SOCKS
+// handshake itself would wait forever (the dialer only honors ctx deadlines).
+var ldapDialTimeout = 10 * time.Second
 
 type LDAPConfig struct {
 	Server string
@@ -126,7 +132,9 @@ func DiscoverSQLInstances(cfg LDAPConfig) ([]models.SQLInstance, error) {
 	var err error
 
 	if cfg.Dialer != nil {
-		netConn, dialErr := cfg.Dialer.DialContext(context.Background(), "tcp", address)
+		dctx, cancel := context.WithTimeout(context.Background(), ldapDialTimeout)
+		netConn, dialErr := cfg.Dialer.DialContext(dctx, "tcp", address)
+		cancel()
 		if dialErr != nil {
 			return nil, fmt.Errorf("ldap connect via proxy failed: %w", dialErr)
 		}
@@ -204,14 +212,17 @@ func DiscoverSQLInstances(cfg LDAPConfig) ([]models.SQLInstance, error) {
 				}
 
 				if len(parts) == 2 {
-					var p int
-					fmt.Sscanf(parts[1], "%d", &p)
-					if p > 0 {
+					if p, err := strconv.Atoi(parts[1]); err == nil && p > 0 {
 						instance.Port = p
+					} else if parts[1] != "" {
+						// MSSQLSvc/host:InstanceName — a named instance: its
+						// port is only known via the SQL Browser, so the
+						// instance name is kept and the port stays 1433.
+						instance.Instance = parts[1]
 					}
 				}
 
-				key := instance.Hostname + ":" + fmt.Sprint(instance.Port)
+				key := strings.ToLower(instance.Hostname) + ":" + fmt.Sprint(instance.Port)
 
 				if !seen[key] {
 					seen[key] = true

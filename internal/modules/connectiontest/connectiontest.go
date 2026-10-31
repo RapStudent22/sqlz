@@ -204,18 +204,25 @@ func Run(instances []models.SQLInstance, opts Options, cb ResultCallback) []Resu
 		workers = 50
 	}
 
-	jobs := make(chan models.SQLInstance)
-	var results []Result
+	type job struct {
+		idx  int
+		inst models.SQLInstance
+	}
+	jobs := make(chan job)
+	// Results are collected by input index so the returned slice (used for
+	// JSON output) is deterministic; the callback still fires live, in
+	// completion order, for the text output.
+	results := make([]Result, len(instances))
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 
 	worker := func() {
 		defer wg.Done()
-		for inst := range jobs {
-			r := testOne(inst, opts)
+		for j := range jobs {
+			r := testOne(j.inst, opts)
 			mu.Lock()
+			results[j.idx] = r
 			cb(r)
-			results = append(results, r)
 			mu.Unlock()
 		}
 	}
@@ -226,8 +233,8 @@ func Run(instances []models.SQLInstance, opts Options, cb ResultCallback) []Resu
 	}
 
 	go func() {
-		for _, inst := range instances {
-			jobs <- inst
+		for i, inst := range instances {
+			jobs <- job{idx: i, inst: inst}
 		}
 		close(jobs)
 	}()

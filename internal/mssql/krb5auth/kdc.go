@@ -60,6 +60,12 @@ func resolveOrSelf(ctx context.Context, host, nameserver string, d Dialer) strin
 	if net.ParseIP(host) != nil || nameserver == "" {
 		return host
 	}
+	// Already "host:port" (e.g. --kdc dc1.cs.org:88): nothing to resolve,
+	// and sending "dc1.cs.org:88" to the DNS client would just waste up to
+	// the lookup timeout.
+	if _, _, err := net.SplitHostPort(host); err == nil {
+		return host
+	}
 	cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	if ip, err := LookupHostIP(cctx, nameserver, host, d); err == nil && ip != "" {

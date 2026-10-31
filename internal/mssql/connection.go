@@ -62,17 +62,3 @@ func (c *Client) TestConnectionWithVersion(
 
 	return result
 }
-
-func (c *Client) IsReachable() bool {
-
-	ctx, cancel := context.WithTimeout(
-		context.Background(),
-		3*time.Second,
-	)
-
-	defer cancel()
-
-	err := c.db.PingContext(ctx)
-
-	return err == nil
-}

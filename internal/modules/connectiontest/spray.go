@@ -20,6 +20,7 @@ type SprayCred struct {
 // by format:
 //
 //	user:password        → password
+//	user:p:password      → password forced (for 32/64-hex passwords)
 //	user:32-hex          → NT hash (pass-the-hash)
 //	user:32-hex:32-hex   → lm:nt pair (nt part is used)
 //	user:64-hex          → AES256 key (pass-the-key)
@@ -72,6 +73,12 @@ func parseSprayLine(line string) (SprayCred, error) {
 	}
 	user = strings.TrimSpace(user)
 
+	// "p:" prefix forces password interpretation: a legitimate 32/64-hex
+	// password would otherwise be misdetected as an NT hash / AES key and
+	// rejected in --auth sql mode.
+	if strings.HasPrefix(secret, "p:") {
+		return SprayCred{Username: user, Secret: strings.TrimPrefix(secret, "p:"), Method: "password"}, nil
+	}
 	// AES256 key: exactly 64 hex chars.
 	if len(secret) == 64 && isHex(secret) {
 		return SprayCred{Username: user, Secret: secret, Method: "aes-key"}, nil

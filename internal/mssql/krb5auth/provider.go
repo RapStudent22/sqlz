@@ -11,6 +11,7 @@
 package krb5auth
 
 import (
+	"context"
 	"encoding/hex"
 	"fmt"
 	"strconv"
@@ -338,38 +339,60 @@ func (a *krbAuth) InitialBytes() ([]byte, error) {
 		tok []byte
 		err error
 	}
+	timeout := a.timeout
+	if timeout <= 0 {
+		timeout = 20 * time.Second
+	}
+	// The context bounds the handshake and lets the login goroutine notice
+	// a timeout: gokrb5 v8.4.4 takes no context (its network calls have
+	// their own ~5s deadlines), so a canceled ctx only makes the goroutine
+	// stop early and drop the client instead of handing back a result
+	// nobody will read.
+	ctx, cancel := context.WithTimeout(context.Background(), timeout+handshakeGrace)
+	defer cancel()
+
 	ch := make(chan result, 1)
 	go func() {
 		cl, err := a.login()
 		if err != nil {
-			ch <- result{err: err}
+			if ctx.Err() == nil {
+				ch <- result{err: err}
+			}
+			return
+		}
+		if ctx.Err() != nil {
+			cl.Destroy() // timed out while logging in
 			return
 		}
 		tkn, err := spnego.SPNEGOClient(cl, a.spn).InitSecContext()
 		if err != nil {
 			cl.Destroy()
-			ch <- result{err: fmt.Errorf("kerberos: SPNEGO to %s: %w", a.spn, err)}
+			if ctx.Err() == nil {
+				ch <- result{err: fmt.Errorf("kerberos: SPNEGO to %s: %w", a.spn, err)}
+			}
 			return
 		}
 		b, err := tkn.Marshal()
 		if err != nil {
 			cl.Destroy()
-			ch <- result{err: err}
+			if ctx.Err() == nil {
+				ch <- result{err: err}
+			}
 			return
 		}
-		ch <- result{cl: cl, tok: b}
+		if ctx.Err() == nil {
+			ch <- result{cl: cl, tok: b}
+		} else {
+			cl.Destroy()
+		}
 	}()
 
-	timeout := a.timeout
-	if timeout <= 0 {
-		timeout = 20 * time.Second
-	}
 	select {
 	case r := <-ch:
 		a.client = r.cl
 		return r.tok, r.err
-	case <-time.After(timeout + handshakeGrace):
-		return nil, fmt.Errorf("kerberos: handshake with KDC %s timed out — port 88 must be reachable directly (Kerberos traffic does not go through the SOCKS5 proxy)", a.kdc)
+	case <-ctx.Done():
+		return nil, fmt.Errorf("kerberos: handshake with KDC %s timed out — KDC traffic goes through the SOCKS5 proxy via a local relay; check that port 88 is reachable from the proxy server", a.kdc)
 	}
 }
 

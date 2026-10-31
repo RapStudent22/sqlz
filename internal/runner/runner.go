@@ -41,14 +41,31 @@ func Run[T any](
 		cfg.Workers = 10
 	}
 
-	jobs := make(chan models.SQLInstance)
-	out := make(chan Result[T])
+	type job struct {
+		idx  int
+		inst models.SQLInstance
+	}
+	type outcome struct {
+		idx int
+		r   Result[T]
+	}
+	jobs := make(chan job)
+	out := make(chan outcome)
 	var wg sync.WaitGroup
 
 	worker := func() {
 		defer wg.Done()
-		for inst := range jobs {
+		for j := range jobs {
+			inst := j.inst
 			r := Result[T]{Instance: inst}
+
+			spn := spnFor(cfg.AuthType, inst, &r)
+			if r.Error != "" {
+				// SPN build failed (e.g. IP target with Kerberos auth):
+				// report it and skip the connection attempt entirely.
+				out <- outcome{idx: j.idx, r: r}
+				continue
+			}
 
 			client, err := mssql.New(mssql.Config{
 				Server:   inst.ConnectionHost(),
@@ -61,7 +78,7 @@ func Run[T any](
 				Dialer:   cfg.Dialer,
 				Realm:    cfg.Realm,
 				KDC:      cfg.KDC,
-				SPN:      spnFor(cfg.AuthType, inst, &r),
+				SPN:      spn,
 				AESKey:   cfg.AESKey,
 				Hash:     cfg.Hash,
 				CCache:   cfg.CCache,
@@ -70,7 +87,7 @@ func Run[T any](
 			})
 			if err != nil {
 				r.Error = err.Error()
-				out <- r
+				out <- outcome{idx: j.idx, r: r}
 				continue
 			}
 
@@ -83,7 +100,7 @@ func Run[T any](
 				r.Value = val
 			}
 
-			out <- r
+			out <- outcome{idx: j.idx, r: r}
 		}
 	}
 
@@ -93,8 +110,8 @@ func Run[T any](
 	}
 
 	go func() {
-		for _, inst := range instances {
-			jobs <- inst
+		for i, inst := range instances {
+			jobs <- job{idx: i, inst: inst}
 		}
 		close(jobs)
 	}()
@@ -104,9 +121,11 @@ func Run[T any](
 		close(out)
 	}()
 
-	var results []Result[T]
-	for r := range out {
-		results = append(results, r)
+	// Collect by input index so the result order (and JSON output) is
+	// deterministic regardless of worker completion order.
+	results := make([]Result[T], len(instances))
+	for o := range out {
+		results[o.idx] = o.r
 	}
 	return results
 }

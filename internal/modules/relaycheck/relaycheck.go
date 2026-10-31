@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"sync"
 	"time"
 
 	"github.com/RapStudent22/sqlz/internal/models"
@@ -162,28 +161,4 @@ func parseEncrypt(body []byte) (EncryptMode, error) {
 		}
 	}
 	return EncryptOff, nil
-}
-
-func Run(instances []models.SQLInstance, opts Options, cb func(Result)) {
-	if opts.Workers <= 0 {
-		opts.Workers = 50
-	}
-
-	sem := make(chan struct{}, opts.Workers)
-	var wg sync.WaitGroup
-	var mu sync.Mutex
-
-	for _, inst := range instances {
-		wg.Add(1)
-		sem <- struct{}{}
-		go func(i models.SQLInstance) {
-			defer wg.Done()
-			defer func() { <-sem }()
-			r := Check(i, opts)
-			mu.Lock()
-			cb(r)
-			mu.Unlock()
-		}(inst)
-	}
-	wg.Wait()
 }

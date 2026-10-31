@@ -71,8 +71,8 @@ type Config struct {
 	QueryTimeout      time.Duration
 
 	// Dialer, when non-nil, routes all SQL Server connections through it.
-	// NOTE: it does not apply to Kerberos traffic — KDC (port 88) dials
-	// go direct through the system network stack.
+	// Kerberos KDC (port 88) traffic goes through it too: New starts a
+	// local relay (krb5auth.ProxyKDC) and points the krb5 config at it.
 	Dialer Dialer
 }
 
@@ -101,7 +101,10 @@ func New(config Config) (*Client, error) {
 
 	// Route KDC traffic through the SOCKS5 proxy too: gokrb5 dials the KDC
 	// itself, so a local relay is started and the krb5 config points at it.
-	if config.AuthType == AuthKerberos && config.Dialer != nil {
+	// The winsspi fallback (Kerberos via the Windows session token, no key
+	// material) never uses gokrb5, so no relay is needed for it.
+	if config.AuthType == AuthKerberos && config.Dialer != nil &&
+		(config.Password != "" || config.AESKey != "" || config.Hash != "" || config.CCache != "") {
 		local, err := krb5auth.ProxyKDC(config.KDC, config.Dialer)
 		if err != nil {
 			return nil, err
